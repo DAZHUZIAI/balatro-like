@@ -2,12 +2,31 @@ import type { Card } from '../core/Card.ts';
 import { SUIT_SYMBOLS, SUIT_COLORS, RANK_LABELS } from '../core/CardType.ts';
 import { CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS } from '../utils/Constants.ts';
 
-export function drawCard(ctx: CanvasRenderingContext2D, card: Card, x: number, y: number, faceUp: boolean): void {
+export function drawCard(
+  ctx: CanvasRenderingContext2D,
+  card: Card,
+  x: number, y: number,
+  faceUp: boolean,
+  angle = 0,
+): void {
+  ctx.save();
+  const cx = x + CARD_WIDTH / 2;
+  const cy = y + CARD_HEIGHT / 2;
+  ctx.translate(cx, cy);
+  if (angle !== 0) ctx.rotate(angle * Math.PI / 180);
+  ctx.translate(-cx, -cy);
+
   if (faceUp) {
     drawCardFace(ctx, card, x, y);
   } else {
     drawCardBack(ctx, x, y);
   }
+
+  ctx.restore();
+}
+
+export function drawCardFaceAt(ctx: CanvasRenderingContext2D, card: Card, cx: number, cy: number, angle = 0): void {
+  drawCard(ctx, card, cx - CARD_WIDTH / 2, cy - CARD_HEIGHT / 2, true, angle);
 }
 
 function drawCardFace(ctx: CanvasRenderingContext2D, card: Card, x: number, y: number): void {
@@ -49,7 +68,6 @@ export function drawCardBack(ctx: CanvasRenderingContext2D, x: number, y: number
   ctx.fill();
   ctx.stroke();
 
-  // Simple pattern on back
   ctx.fillStyle = '#283593';
   ctx.font = '24px monospace';
   ctx.textAlign = 'center';
@@ -57,7 +75,7 @@ export function drawCardBack(ctx: CanvasRenderingContext2D, x: number, y: number
   ctx.fillText('✦', x + CARD_WIDTH / 2, y + CARD_HEIGHT / 2);
 }
 
-function roundRect(
+export function roundRect(
   ctx: CanvasRenderingContext2D,
   x: number, y: number,
   w: number, h: number,
@@ -74,4 +92,36 @@ function roundRect(
   ctx.lineTo(x, y + r);
   ctx.arcTo(x, y, x + r, y, r);
   ctx.closePath();
+}
+
+/** Compute fan position for a card in hand */
+export function getFanPosition(
+  index: number,
+  total: number,
+  centerX: number,
+  baseY: number,
+): { x: number; y: number; angle: number } {
+  if (total <= 1) return { x: centerX, y: baseY, angle: 0 };
+
+  const maxAngle = 18;
+  const spread = Math.min(350, total * 40);
+  const progress = total <= 1 ? 0 : (index / (total - 1)) * 2 - 1; // -1 to 1
+  const angle = -progress * maxAngle;
+  const x = centerX + progress * spread / 2;
+  const y = baseY - Math.abs(progress) * 15;
+
+  return { x, y, angle };
+}
+
+/** Z-order for fan: middle on top */
+export function fanDrawOrder(total: number): number[] {
+  const order: number[] = [];
+  if (total <= 1) return [0];
+  let left = Math.floor((total - 1) / 2);
+  let right = left + 1;
+  while (left >= 0 || right < total) {
+    if (right < total) order.push(right++);
+    if (left >= 0) order.push(left--);
+  }
+  return order;
 }
