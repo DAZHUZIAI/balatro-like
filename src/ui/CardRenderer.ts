@@ -58,6 +58,64 @@ function drawCardFace(ctx: CanvasRenderingContext2D, card: Card, x: number, y: n
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(symbol, x + CARD_WIDTH / 2, y + CARD_HEIGHT / 2);
+
+  // Enhancement indicators
+  if (card.enhancement) {
+    drawEnhancement(ctx, card, x, y);
+  }
+}
+
+function drawEnhancement(ctx: CanvasRenderingContext2D, card: Card, x: number, y: number): void {
+  switch (card.enhancement) {
+    case 'stone':
+      ctx.save();
+      ctx.fillStyle = 'rgba(100, 100, 100, 0.25)';
+      roundRect(ctx, x, y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS);
+      ctx.fill();
+      ctx.fillStyle = '#888';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('S', x + CARD_WIDTH - 6, y + CARD_HEIGHT - 4);
+      ctx.restore();
+      break;
+    case 'glass':
+      ctx.save();
+      ctx.strokeStyle = '#00e5ff';
+      ctx.lineWidth = 3;
+      ctx.shadowColor = '#00e5ff';
+      ctx.shadowBlur = 8;
+      roundRect(ctx, x, y, CARD_WIDTH, CARD_HEIGHT, CARD_RADIUS);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#00e5ff';
+      ctx.font = 'bold 14px monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText('G', x + CARD_WIDTH - 6, y + CARD_HEIGHT - 4);
+      ctx.restore();
+      break;
+    case 'diamond_bonus':
+    case 'heart_bonus':
+    case 'spade_bonus':
+    case 'club_bonus': {
+      const symbolMap: Record<string, string> = {
+        diamond_bonus: '♦', heart_bonus: '♥', spade_bonus: '♠', club_bonus: '♣',
+      };
+      const colorMap: Record<string, string> = {
+        diamond_bonus: '#e63946', heart_bonus: '#e63946',
+        spade_bonus: '#1a1a2e', club_bonus: '#1a1a2e',
+      };
+      ctx.save();
+      ctx.fillStyle = colorMap[card.enhancement];
+      ctx.font = '14px monospace';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText(symbolMap[card.enhancement], x + CARD_WIDTH - 6, y + 4);
+      ctx.restore();
+      break;
+    }
+  }
 }
 
 export function drawCardBack(ctx: CanvasRenderingContext2D, x: number, y: number): void {

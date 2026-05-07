@@ -1,5 +1,7 @@
 import { MVP_JOKERS } from './JokerData.ts';
 import type { JokerDefinition } from './JokerData.ts';
+import { TAROT_CARDS } from './TarotData.ts';
+import type { TarotDef } from './TarotData.ts';
 
 export interface ShopItem {
   id: string;
@@ -8,6 +10,8 @@ export interface ShopItem {
   cost: number;
   /** If this is a joker card, reference to its JokerDefinition */
   jokerDef?: JokerDefinition;
+  /** If this is a tarot card, reference to its TarotDef */
+  tarotDef?: TarotDef;
 }
 
 const UTILITY_ITEMS: ShopItem[] = [
@@ -21,12 +25,13 @@ export class ShopManager {
   gold = 0;
   items: ShopItem[] = [];
 
-  /** Generate new shop items — mix of jokers and utilities */
+  /** Generate new shop items — mix of jokers, tarots, and utilities */
   generate(): void {
     const jokerPool = [...MVP_JOKERS].sort(() => Math.random() - 0.5);
+    const tarotPool = [...TAROT_CARDS].sort(() => Math.random() - 0.5);
     const utilPool = [...UTILITY_ITEMS].sort(() => Math.random() - 0.5);
 
-    // Pick 2 jokers + 1 utility
+    // Pick 2 jokers + 1 tarot + 1 utility
     const jokers = jokerPool.slice(0, 2).map(j => ({
       id: j.id,
       name: j.name,
@@ -35,9 +40,17 @@ export class ShopManager {
       jokerDef: j,
     }));
 
+    const oneTarot = tarotPool.slice(0, 1).map(t => ({
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      cost: t.cost,
+      tarotDef: t,
+    }));
+
     const oneUtil = utilPool.slice(0, 1);
 
-    this.items = [...jokers, ...oneUtil].sort(() => Math.random() - 0.5);
+    this.items = [...jokers, ...oneTarot, ...oneUtil].sort(() => Math.random() - 0.5);
   }
 
   /** Try to buy item at index. Returns true if purchased. */

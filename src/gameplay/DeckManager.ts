@@ -54,4 +54,10 @@ export class DeckManager {
     this.discards = [];
     this.shuffle();
   }
+
+  /** Permanently remove a card from the game (e.g. broken glass card) */
+  removeCardFromGame(id: string): void {
+    this.cards = this.cards.filter(c => c.id !== id);
+    this.discards = this.discards.filter(c => c.id !== id);
+  }
 }

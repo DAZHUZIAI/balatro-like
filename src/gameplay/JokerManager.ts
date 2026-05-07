@@ -1,4 +1,4 @@
-import { HandType, Rank } from '../core/CardType.ts';
+import { Suit, HandType, Rank } from '../core/CardType.ts';
 import type { Card } from '../core/Card.ts';
 import { JokerTrigger } from './JokerData.ts';
 import type { JokerDefinition } from './JokerData.ts';
@@ -17,6 +17,8 @@ export class JokerManager {
     if (joker.id === 'ice_cream') this.state.set('ice_cream_mult', 20);
     if (joker.id === 'ride_the_bus') this.state.set('ride_streak', 0);
     if (joker.id === 'supernova') this.state.set('supernova_counts', 0);
+    if (joker.id === 'ramen') this.state.set('ramen_mult', 20);
+    if (joker.id === 'matador') this.state.set('hands_this_round', 0);
 
     return true;
   }
@@ -61,17 +63,26 @@ export class JokerManager {
     let c = chips;
     let m = mult;
 
+    // Consume any chips accumulated from discards (Faceless Joker)
+    const discardChips = this.state.get('pending_discard_chips') ?? 0;
+    this.state.set('pending_discard_chips', 0);
+    c += discardChips;
+
     for (const joker of this.activeJokers) {
       switch (joker.effect.trigger) {
         case JokerTrigger.Passive:
           if (passCondition(joker.effect.condition, { discardsRemaining })) {
             c += joker.effect.chips;
-            m = joker.effect.isXMult ? m * Math.max(1, m + joker.effect.mult) : m + joker.effect.mult;
+            m = joker.effect.isXMult ? m * Math.max(1, 1 + joker.effect.mult) : m + joker.effect.mult;
           }
           break;
 
         case JokerTrigger.OnHandScored:
-          if (handCondition(joker.effect.condition, handType, { discardsRemaining })) {
+          if (joker.effect.condition === 'per_hand_this_round') {
+            const handCount = this.state.get('hands_this_round') ?? 0;
+            c += joker.effect.chips * handCount;
+            m += joker.effect.mult * handCount;
+          } else if (handCondition(joker.effect.condition, handType, { discardsRemaining }, playedCards)) {
             c += joker.effect.chips;
             m += joker.effect.mult;
           }
@@ -121,6 +132,9 @@ export class JokerManager {
         }
       }
     }
+    // Increment hand counter for per_hand_this_round (Matador)
+    const cur = this.state.get('hands_this_round') ?? 0;
+    this.state.set('hands_this_round', cur + 1);
   }
 
   /** Get Ice Cream's current mult value */
@@ -128,17 +142,35 @@ export class JokerManager {
     return this.state.get('ice_cream_mult') ?? 20;
   }
 
-  /** Called after discarding */
-  onDiscard(cardCount: number): number {
-    let extraChips = 0;
+  /** Get Ramen's current mult value */
+  get ramenMult(): number {
+    return this.state.get('ramen_mult') ?? 20;
+  }
+
+  /** Reset round-scoped state (called when entering a new blind) */
+  resetRound(): void {
+    this.state.set('hands_this_round', 0);
+  }
+
+  /** Called after discarding. Returns gold earned and stores chip bonuses. */
+  onDiscard(cardCount: number): { gold: number } {
+    let gold = 0;
     for (const joker of this.activeJokers) {
       if (joker.effect.trigger === JokerTrigger.OnDiscard) {
         if (joker.id === 'faceless_joker' && cardCount >= 3) {
-          extraChips += joker.effect.chips;
+          const pending = this.state.get('pending_discard_chips') ?? 0;
+          this.state.set('pending_discard_chips', pending + joker.effect.chips);
+        }
+        if (joker.id === 'trading_card') {
+          gold += joker.effect.gold;
+        }
+        if (joker.id === 'ramen') {
+          const cur = this.state.get('ramen_mult') ?? 20;
+          this.state.set('ramen_mult', Math.max(0, cur + joker.effect.mult)); // mult is -3
         }
       }
     }
-    return extraChips;
+    return { gold };
   }
 
   /** Called at end of round. Returns gold earned. */
@@ -169,6 +201,7 @@ function handCondition(
   cond: string,
   handType: HandType,
   ctx: { discardsRemaining: number },
+  playedCards: Card[],
 ): boolean {
   if (cond === 'always') return true;
 
@@ -178,6 +211,18 @@ function handCondition(
 
   // per_discard_remaining
   if (cond === 'per_discard_remaining') return ctx.discardsRemaining > 0;
+
+  // all_black (Blackboard)
+  if (cond === 'all_black') return playedCards.length > 0 && playedCards.every(c => c.suit === Suit.Spades || c.suit === Suit.Clubs);
+
+  // hand=straight_or_flush (Crazy Joker)
+  if (cond === 'hand=straight_or_flush') return handType === HandType.Straight || handType === HandType.Flush || handType === HandType.StraightFlush;
+
+  // hand=5cards (Droll Joker)
+  if (cond === 'hand=5cards') return playedCards.length === 5;
+
+  // has_stone (Stone Joker)
+  if (cond === 'has_stone') return playedCards.some(c => c.enhancement === 'stone');
 
   return false;
 }
@@ -201,9 +246,11 @@ function cardCondition(cond: string, card: Card): boolean {
 
   if (cond === 'rank_is_even') return card.rank % 2 === 0;
 
-  if (cond === 'is_enhanced') return false; // No enhanced cards in MVP
+  if (cond === 'is_enhanced') return card.enhancement != null;
 
-  if (cond === 'no_face_cards') return card.rank > Rank.Ten; // condition on the hand, handled per-card
+  if (cond === 'no_face_cards') return !isFaceCard(card);
+
+  if (cond === 'is_glass') return card.enhancement === 'glass';
 
   return false;
 }

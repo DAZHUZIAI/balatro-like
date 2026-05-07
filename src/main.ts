@@ -7,6 +7,8 @@ import { drawCardFaceAt, drawCardBack, getFanPosition, fanDrawOrder, roundRect }
 import { evaluateHand, handTypeLabel } from './core/HandEvaluator.ts';
 import { startPlayAnimation, update, renderAnimations, isAnimating } from './ui/Animations.ts';
 import type { Card } from './core/Card.ts';
+import type { TarotDef } from './gameplay/TarotData.ts';
+import { applyEnhancement, isStone, isGlass } from './core/Card.ts';
 
 const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -26,10 +28,16 @@ const MAX_SELECT = 5;
 let phase: 'playing' | 'shop' | 'game_over' = 'playing';
 let pendingNewAnte = false;
 
+// ─── Tarot State ───
+let tarotInventory: TarotDef[] = [];
+let tarotApplyMode: { tarot: TarotDef } | null = null;
+
 // ─── Button geometry ───
 const B = {
+  USE_TAROT: { x: CANVAS_WIDTH / 2 - 230, y: CANVAS_HEIGHT - 155, w: 110, h: 40 },
   PLAY: { x: CANVAS_WIDTH / 2 - 110, y: CANVAS_HEIGHT - 155, w: 100, h: 40 },
   DISCARD: { x: CANVAS_WIDTH / 2 + 10, y: CANVAS_HEIGHT - 155, w: 100, h: 40 },
+  TAROT_CANCEL: { x: CANVAS_WIDTH / 2 - 50, y: CANVAS_HEIGHT - 130, w: 100, h: 32 },
   SHOP_NEXT: { x: CANVAS_WIDTH / 2 - 70, y: CANVAS_HEIGHT - 100, w: 140, h: 40 },
   SHOP_REROLL: { x: CANVAS_WIDTH / 2 - 70, y: CANVAS_HEIGHT - 150, w: 140, h: 40 },
   GAME_RESTART: { x: CANVAS_WIDTH / 2 - 70, y: CANVAS_HEIGHT - 120, w: 140, h: 44 },
@@ -46,6 +54,8 @@ function startGame() {
   round.newGame();
   shop.gold = 0;
   jokers.clear();
+  tarotInventory = [];
+  tarotApplyMode = null;
   shop.generate();
   phase = 'playing';
   pendingNewAnte = false;
@@ -69,13 +79,28 @@ function playHand() {
   let mult = result.score.mult;
 
   // ─── Joker pipeline ───
-  // 1. Per-card joker effects
+  // 1. Per-card joker effects + enhancement bonuses
   let goldFromCards = 0;
+  const brokenGlass: string[] = [];
   for (const card of playedCards) {
+    // Joker card-scored effects
     const cardResult = jokers.applyCardScored(card, 0, 0);
     chips += cardResult.chips;
     mult += cardResult.mult;
     goldFromCards += cardResult.gold;
+
+    // Stone card: +30 chips
+    if (isStone(card)) {
+      chips += 30;
+    }
+
+    // Glass card: x2 mult, 1-in-6 chance to break
+    if (isGlass(card)) {
+      mult *= 2;
+      if (Math.random() < 1 / 6) {
+        brokenGlass.push(card.id);
+      }
+    }
   }
 
   // 2. No-face-card check for Ride the Bus
@@ -90,6 +115,11 @@ function playHand() {
   // It applies as part of the Passive trigger, but we handle it via state
   if (jokers.activeJokers.some(j => j.id === 'ice_cream')) {
     mult += iceCreamBonus;
+  }
+
+  // Ramen: +ramenMult mult (decays on discard)
+  if (jokers.activeJokers.some(j => j.id === 'ramen')) {
+    mult += jokers.ramenMult;
   }
 
   const modified = jokers.applyHandResult(
@@ -140,6 +170,12 @@ function playHand() {
   hand.push(...replacements);
   selected.clear();
 
+  // Destroy broken glass cards permanently
+  for (const id of brokenGlass) {
+    deck.removeCardFromGame(id);
+    console.log(`💔 Glass card shattered!`);
+  }
+
   // ─── Joker post-hand effects ───
   jokers.onHandPlayed();
 
@@ -168,9 +204,12 @@ function discardSelected() {
   round.discardsRemaining--;
 
   // Joker on-discard effects
-  const extraChips = jokers.onDiscard(count);
+  const { gold: discardGold } = jokers.onDiscard(count);
+  if (discardGold > 0) {
+    shop.earn(discardGold);
+  }
 
-  console.log(`[DISCARD] ${count} cards. Discards left: ${round.discardsRemaining}${extraChips > 0 ? ` (+${extraChips} chips)` : ''}`);
+  console.log(`[DISCARD] ${count} cards. Discards left: ${round.discardsRemaining}${discardGold > 0 ? ` (+$${discardGold})` : ''}`);
 }
 
 function onBlindBeaten() {
@@ -213,6 +252,13 @@ function buyShopItem(index: number) {
     return;
   }
 
+  // Check if this is a tarot card
+  if (item.tarotDef) {
+    tarotInventory.push(item.tarotDef);
+    console.log(`🔮 Bought tarot: ${item.name}`);
+    return;
+  }
+
   // Utility items
   switch (item.id) {
     case 'add_hand':
@@ -234,10 +280,34 @@ function buyShopItem(index: number) {
 }
 
 function exitShop() {
+  jokers.resetRound();
   round.resetRound();
   dealNewHand();
   phase = 'playing';
   console.log(`\n%c=== ${round.blindLabel} — target ${round.getBlindConfig().targetScore} ===`, 'color: #ffd700; font-weight: bold');
+}
+
+// ─── Tarot functions ───
+
+function enterTarotMode(): void {
+  if (tarotInventory.length === 0) return;
+  tarotApplyMode = { tarot: tarotInventory[0] };
+}
+
+function cancelTarotMode(): void {
+  tarotApplyMode = null;
+}
+
+function applyTarotToCard(cardId: string): boolean {
+  const mode = tarotApplyMode;
+  if (!mode) return false;
+  const idx = hand.findIndex(c => c.id === cardId);
+  if (idx === -1) return false;
+  hand[idx] = applyEnhancement(hand[idx], mode.tarot.enhancement);
+  tarotInventory = tarotInventory.filter(t => t.id !== mode.tarot.id);
+  console.log(`🔮 Applied ${mode.tarot.name} (${mode.tarot.enhancement})`);
+  tarotApplyMode = null;
+  return true;
 }
 
 // ─── Rendering ───
@@ -439,8 +509,44 @@ function renderPlayScene() {
   // Action buttons
   const canPlay = selected.size > 0 && !isAnimating() && round.handsRemaining > 0;
   const canDiscard = selected.size > 0 && round.discardsRemaining > 0 && !isAnimating() && phase === 'playing';
+  const canUseTarot = tarotInventory.length > 0 && !isAnimating() && round.handsRemaining > 0 && !tarotApplyMode;
+  drawButton(B.USE_TAROT, 'USE TAROT', canUseTarot);
   drawButton(B.PLAY, 'PLAY', canPlay);
   drawButton(B.DISCARD, 'DISCARD', canDiscard);
+
+  // Tarot application mode overlay
+  if (tarotApplyMode) {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    ctx.fillStyle = '#00e5ff';
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Apply "${tarotApplyMode.tarot.name}" — Click a card in hand`, CANVAS_WIDTH / 2, CANVAS_HEIGHT - 180);
+
+    ctx.fillStyle = '#e63946';
+    roundRect(ctx, B.TAROT_CANCEL.x, B.TAROT_CANCEL.y, B.TAROT_CANCEL.w, B.TAROT_CANCEL.h, 6);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('CANCEL', B.TAROT_CANCEL.x + B.TAROT_CANCEL.w / 2, B.TAROT_CANCEL.y + B.TAROT_CANCEL.h / 2);
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  // Tarot inventory display
+  if (tarotInventory.length > 0 && !tarotApplyMode) {
+    ctx.fillStyle = 'rgba(0, 229, 255, 0.6)';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('TAROTS:', 20, 100 + CARD_HEIGHT + 30);
+    ctx.font = '11px monospace';
+    tarotInventory.forEach((t, i) => {
+      ctx.fillStyle = '#00e5ff';
+      ctx.fillText(t.name, 20 + i * 85, 100 + CARD_HEIGHT + 50);
+    });
+  }
 
   if (round.handsRemaining <= 0 && !round.isBlindBeaten && !isAnimating()) {
     ctx.fillStyle = '#e63946';
@@ -483,18 +589,19 @@ function renderShopScene() {
     const x = startX + i * (itemW + gap);
 
     const isJoker = !!item.jokerDef;
-    ctx.fillStyle = isJoker ? '#1a1a2e' : '#1a1a2e';
-    ctx.strokeStyle = isJoker ? 'rgba(255,215,0,0.5)' : 'rgba(100,180,255,0.3)';
+    const isTarot = !!item.tarotDef;
+    ctx.fillStyle = isTarot ? '#1a1a3e' : '#1a1a2e';
+    ctx.strokeStyle = isTarot ? 'rgba(0,229,255,0.5)' : (isJoker ? 'rgba(255,215,0,0.5)' : 'rgba(100,180,255,0.3)');
     ctx.lineWidth = 2;
     roundRect(ctx, x, itemY, itemW, itemH, 10);
     ctx.fill();
     ctx.stroke();
 
     // Type badge
-    ctx.fillStyle = isJoker ? 'rgba(255,215,0,0.15)' : 'rgba(100,180,255,0.15)';
+    ctx.fillStyle = isTarot ? 'rgba(0,229,255,0.15)' : (isJoker ? 'rgba(255,215,0,0.15)' : 'rgba(100,180,255,0.15)');
     ctx.font = '10px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(isJoker ? '🃏 JOKER' : '📦 ITEM', x + itemW / 2, itemY + 18);
+    ctx.fillText(isTarot ? '🔮 TAROT' : (isJoker ? '🃏 JOKER' : '📦 ITEM'), x + itemW / 2, itemY + 18);
 
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 15px monospace';
@@ -597,6 +704,34 @@ canvas.addEventListener('click', (e) => {
 });
 
 function handlePlayClick(mx: number, my: number) {
+  // Tarot apply mode: clicking a card applies the tarot
+  if (tarotApplyMode) {
+    if (hitTest(mx, my, B.TAROT_CANCEL)) {
+      cancelTarotMode();
+      return;
+    }
+    // Click card to apply tarot
+    const baseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70;
+    const cx = CANVAS_WIDTH / 2;
+    const drawOrder = fanDrawOrder(hand.length).reverse();
+    for (const idx of drawOrder) {
+      const pos = getFanPosition(idx, hand.length, cx, baseY);
+      if (mx >= pos.x - CARD_WIDTH / 2 && mx <= pos.x + CARD_WIDTH / 2 &&
+          my >= pos.y - CARD_HEIGHT / 2 && my <= pos.y + CARD_HEIGHT / 2) {
+        applyTarotToCard(hand[idx].id);
+        return;
+      }
+    }
+    return; // Block other clicks in tarot mode
+  }
+
+  // USE TAROT button
+  if (hitTest(mx, my, B.USE_TAROT) && tarotInventory.length > 0 && !isAnimating()) {
+    enterTarotMode();
+    return;
+  }
+
+  // PLAY / DISCARD buttons
   if (hitTest(mx, my, B.PLAY) && selected.size > 0 && round.handsRemaining > 0 && !isAnimating()) {
     playHand(); return;
   }
