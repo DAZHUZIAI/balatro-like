@@ -1,14 +1,19 @@
+import { MVP_JOKERS } from './JokerData.ts';
+import type { JokerDefinition } from './JokerData.ts';
+
 export interface ShopItem {
   id: string;
   name: string;
   description: string;
   cost: number;
+  /** If this is a joker card, reference to its JokerDefinition */
+  jokerDef?: JokerDefinition;
 }
 
-const ALL_ITEMS: ShopItem[] = [
-  { id: 'add_hand', name: '+1 Hand', description: '+1 hand per round', cost: 4 },
-  { id: 'add_discard', name: '+1 Discard', description: '+1 discard per round', cost: 2 },
-  { id: 'remove_card', name: 'Remove Card', description: 'Remove a card from your deck', cost: 3 },
+const UTILITY_ITEMS: ShopItem[] = [
+  { id: 'add_hand', name: '+1 Hand', description: '+1 hand this round', cost: 4 },
+  { id: 'add_discard', name: '+1 Discard', description: '+1 discard this round', cost: 2 },
+  { id: 'remove_card', name: 'Remove Card', description: 'Reset deck (remove all) remove_card', cost: 3 },
   { id: 'bonus_gold', name: 'Bonus Gold', description: 'Gain $3 now', cost: 0 },
 ];
 
@@ -16,11 +21,23 @@ export class ShopManager {
   gold = 0;
   items: ShopItem[] = [];
 
-  /** Generate new shop items */
+  /** Generate new shop items — mix of jokers and utilities */
   generate(): void {
-    const shuffled = [...ALL_ITEMS].sort(() => Math.random() - 0.5);
-    // Pick 3 random items, but always include bonus gold if ante is tough
-    this.items = shuffled.slice(0, 3);
+    const jokerPool = [...MVP_JOKERS].sort(() => Math.random() - 0.5);
+    const utilPool = [...UTILITY_ITEMS].sort(() => Math.random() - 0.5);
+
+    // Pick 2 jokers + 1 utility
+    const jokers = jokerPool.slice(0, 2).map(j => ({
+      id: j.id,
+      name: j.name,
+      description: j.description,
+      cost: j.cost,
+      jokerDef: j,
+    }));
+
+    const oneUtil = utilPool.slice(0, 1);
+
+    this.items = [...jokers, ...oneUtil].sort(() => Math.random() - 0.5);
   }
 
   /** Try to buy item at index. Returns true if purchased. */

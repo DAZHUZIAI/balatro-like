@@ -2,6 +2,7 @@ import { CANVAS_WIDTH, CANVAS_HEIGHT, CARD_WIDTH, CARD_HEIGHT } from './utils/Co
 import { DeckManager } from './gameplay/DeckManager.ts';
 import { RoundManager, MAX_HANDS_PER_BLIND, MAX_DISCARDS_PER_BLIND } from './gameplay/RoundManager.ts';
 import { ShopManager } from './gameplay/ShopManager.ts';
+import { JokerManager, isFaceCard } from './gameplay/JokerManager.ts';
 import { drawCardFaceAt, drawCardBack, getFanPosition, fanDrawOrder, roundRect } from './ui/CardRenderer.ts';
 import { evaluateHand, handTypeLabel } from './core/HandEvaluator.ts';
 import { startPlayAnimation, update, renderAnimations, isAnimating } from './ui/Animations.ts';
@@ -16,6 +17,7 @@ canvas.height = CANVAS_HEIGHT;
 const deck = new DeckManager();
 const round = new RoundManager();
 const shop = new ShopManager();
+const jokers = new JokerManager();
 let hand: Card[] = [];
 const selected = new Set<string>();
 const MAX_SELECT = 5;
@@ -34,6 +36,7 @@ const B = {
 };
 
 let shopBtnRects: { x: number; y: number; w: number; h: number; index: number }[] = [];
+let jokerSlotRects: { x: number; y: number; w: number; h: number; index: number }[] = [];
 
 // ─── Game Flow ───
 
@@ -42,6 +45,7 @@ function startGame() {
   deck.shuffle();
   round.newGame();
   shop.gold = 0;
+  jokers.clear();
   shop.generate();
   phase = 'playing';
   pendingNewAnte = false;
@@ -57,12 +61,72 @@ function dealNewHand() {
 
 function playHand() {
   if (selected.size === 0 || isAnimating() || phase !== 'playing') return;
+  if (round.handsRemaining <= 0) return;
 
   const playedCards = hand.filter(c => selected.has(c.id));
   const result = evaluateHand(playedCards);
-  const score = result.score.chips * result.score.mult;
+  let chips = result.score.chips;
+  let mult = result.score.mult;
 
+  // ─── Joker pipeline ───
+  // 1. Per-card joker effects
+  let goldFromCards = 0;
+  for (const card of playedCards) {
+    const cardResult = jokers.applyCardScored(card, 0, 0);
+    chips += cardResult.chips;
+    mult += cardResult.mult;
+    goldFromCards += cardResult.gold;
+  }
+
+  // 2. No-face-card check for Ride the Bus
+  const hasFaceCard = playedCards.some(isFaceCard);
+  if (hasFaceCard) {
+    jokers.setState('ride_streak', 0);
+  }
+
+  // 3. Hand-level joker effects (includes Ice Cream's base mult)
+  let iceCreamBonus = jokers.iceCreamMult;
+  // Ice Cream's effect is: +iceCreamMult mult, but description says +20 mult
+  // It applies as part of the Passive trigger, but we handle it via state
+  if (jokers.activeJokers.some(j => j.id === 'ice_cream')) {
+    mult += iceCreamBonus;
+  }
+
+  const modified = jokers.applyHandResult(
+    result.handType, chips, mult, playedCards, round.discardsRemaining,
+  );
+  chips = modified.chips;
+  mult = modified.mult;
+
+  // 4. Supernova: +1 mult per time this hand type was played
+  const supernova = jokers.activeJokers.find(j => j.id === 'supernova');
+  if (supernova) {
+    const count = jokers.getState('supernova_counts');
+    mult += count;
+    jokers.setState('supernova_counts', count + 1);
+  }
+
+  // 5. Ride the Bus: +1 mult per consecutive hand without face card
+  const rideBus = jokers.activeJokers.find(j => j.id === 'ride_the_bus');
+  if (rideBus && !hasFaceCard) {
+    const streak = jokers.getState('ride_streak');
+    mult += streak;
+    jokers.setState('ride_streak', streak + 1);
+  }
+
+  // 6. Banner: +10 chips per remaining discard
+  const banner = jokers.activeJokers.find(j => j.id === 'banner');
+  if (banner) {
+    chips += banner.effect.chips * round.discardsRemaining;
+  }
+
+  const score = chips * mult;
   const beaten = round.playHand(score);
+
+  // Gold from Business Card
+  if (goldFromCards > 0) {
+    shop.earn(goldFromCards);
+  }
 
   const handType = handTypeLabel(result.handType);
   const fromPositions = playedCards.map(c => {
@@ -76,10 +140,13 @@ function playHand() {
   hand.push(...replacements);
   selected.clear();
 
-  console.log(`%c[PLAY] ${handType} +${score}  (${round.currentScore}/${round.getBlindConfig().targetScore})  Hands left: ${round.handsRemaining}`,
+  // ─── Joker post-hand effects ───
+  jokers.onHandPlayed();
+
+  console.log(`%c[PLAY] ${handType} ${chips}×${mult}=${score} (${round.currentScore}/${round.getBlindConfig().targetScore})`,
     beaten ? 'color: #4caf50; font-weight: bold' : 'color: gold');
 
-  startPlayAnimation(playedCards, fromPositions, handType, result.score.chips, result.score.mult, () => {
+  startPlayAnimation(playedCards, fromPositions, handType, chips, mult, () => {
     if (beaten) {
       onBlindBeaten();
     } else if (round.isOutOfHands) {
@@ -100,16 +167,24 @@ function discardSelected() {
   selected.clear();
   round.discardsRemaining--;
 
-  console.log(`[DISCARD] ${count} cards. Discards left: ${round.discardsRemaining}`);
+  // Joker on-discard effects
+  const extraChips = jokers.onDiscard(count);
+
+  console.log(`[DISCARD] ${count} cards. Discards left: ${round.discardsRemaining}${extraChips > 0 ? ` (+${extraChips} chips)` : ''}`);
 }
 
 function onBlindBeaten() {
   const gold = round.collectReward();
   pendingNewAnte = round.advanceBlind();
-  shop.earn(gold);
+
+  // End-of-round joker effects
+  const jokerGold = jokers.onRoundEnd();
+
+  shop.earn(gold + jokerGold);
   shop.generate();
   phase = 'shop';
-  console.log(`%c🎉 BLIND BEATEN! +$${gold}`, 'color: #4caf50; font-weight: bold');
+  console.log(`%c🎉 BLIND BEATEN! +$${gold}${jokerGold > 0 ? ` (+$${jokerGold} from jokers)` : ''}`,
+    'color: #4caf50; font-weight: bold');
   if (pendingNewAnte) {
     console.log(`%c⬆ ANTE ${round.ante}!`, 'color: #ffd700; font-weight: bold');
   }
@@ -126,7 +201,19 @@ function buyShopItem(index: number) {
   if (!item) return;
   if (!shop.purchase(index)) return;
 
-  // Apply effect
+  // Check if this is a joker
+  if (item.jokerDef) {
+    if (jokers.add(item.jokerDef)) {
+      console.log(`🃏 Bought joker: ${item.name}`);
+    } else {
+      // No slot available, refund
+      shop.gold += item.cost;
+      console.log('No joker slots available!');
+    }
+    return;
+  }
+
+  // Utility items
   switch (item.id) {
     case 'add_hand':
       round.handsRemaining = Math.min(round.handsRemaining + 1, 10);
@@ -135,7 +222,7 @@ function buyShopItem(index: number) {
       round.discardsRemaining = Math.min(round.discardsRemaining + 1, 10);
       break;
     case 'remove_card':
-      deck.init(); // Simple: reset to 52-card deck
+      deck.init();
       deck.shuffle();
       break;
     case 'bonus_gold':
@@ -160,12 +247,10 @@ function renderScoreBar(y: number, current: number, target: number) {
   const barH = 20;
   const x = 20;
 
-  // Background
   ctx.fillStyle = '#1a1a2e';
   roundRect(ctx, x, y, barW, barH, 6);
   ctx.fill();
 
-  // Progress
   const progress = Math.min(current / target, 1);
   if (progress > 0) {
     const grad = ctx.createLinearGradient(x, y, x + barW * progress, y);
@@ -176,13 +261,11 @@ function renderScoreBar(y: number, current: number, target: number) {
     ctx.fill();
   }
 
-  // Border
   ctx.strokeStyle = 'rgba(255,255,255,0.15)';
   ctx.lineWidth = 1;
   roundRect(ctx, x, y, barW, barH, 6);
   ctx.stroke();
 
-  // Text
   ctx.fillStyle = '#fff';
   ctx.font = 'bold 12px monospace';
   ctx.textAlign = 'center';
@@ -191,10 +274,75 @@ function renderScoreBar(y: number, current: number, target: number) {
   ctx.textBaseline = 'alphabetic';
 }
 
+/** Render joker slots on the right side */
+function renderJokerSlots() {
+  const slotW = 140;
+  const slotH = 36;
+  const startX = CANVAS_WIDTH - slotW - 10;
+  const startY = 90;
+  const gap = 4;
+
+  jokerSlotRects = [];
+
+  // Title
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.font = '10px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('JOKERS', CANVAS_WIDTH - 10, startY - 4);
+
+  for (let i = 0; i < 5; i++) {
+    const y = startY + i * (slotH + gap);
+    const joker = jokers.slots[i];
+    jokerSlotRects.push({ x: startX, y, w: slotW, h: slotH, index: i });
+
+    if (joker) {
+      // Filled slot
+      ctx.fillStyle = '#1a1a2e';
+      ctx.strokeStyle = 'rgba(255,215,0,0.4)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, startX, y, slotW, slotH, 6);
+      ctx.fill();
+      ctx.stroke();
+
+      // Joker name
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(joker.name, startX + 8, y + 14);
+
+      // Description
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.font = '9px monospace';
+      ctx.fillText(joker.description, startX + 8, y + 28);
+
+      // Ice cream special display
+      if (joker.id === 'ice_cream') {
+        ctx.fillStyle = '#64b5f6';
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${jokers.iceCreamMult}m`, startX + slotW - 8, y + 14);
+      }
+
+      // Egg special display
+      if (joker.id === 'egg') {
+        ctx.fillStyle = '#ffd700';
+        ctx.font = 'bold 10px monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText(`$${jokers.getState('egg_gold')}`, startX + slotW - 8, y + 14);
+      }
+    } else {
+      // Empty slot
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, startX, y, slotW, slotH, 6);
+      ctx.stroke();
+    }
+  }
+}
+
 function render() {
   ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-  // ─── Background ───
   ctx.fillStyle = '#0d5c2e';
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
@@ -206,19 +354,17 @@ function render() {
 function renderPlayScene() {
   const blind = round.getBlindConfig();
 
-  // ─── Top bar ───
+  // Top bar
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
   ctx.font = 'bold 20px monospace';
   ctx.textAlign = 'left';
   ctx.fillText(round.blindLabel, 20, 28);
 
-  // Gold
   ctx.fillStyle = '#ffd700';
   ctx.textAlign = 'right';
   ctx.font = 'bold 16px monospace';
   ctx.fillText(`$${shop.gold}`, CANVAS_WIDTH - 20, 28);
 
-  // Stats
   ctx.textAlign = 'left';
   ctx.font = '13px monospace';
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
@@ -227,22 +373,25 @@ function renderPlayScene() {
     `Deck: ${deck.remaining}`,
     20, 50);
 
-  // ─── Score bar ───
+  // Score bar
   renderScoreBar(62, round.currentScore, blind.targetScore);
 
-  // ─── Deck pile ───
+  // Deck pile
   drawCardBack(ctx, 20, 100);
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.font = '11px monospace';
   ctx.textAlign = 'center';
   ctx.fillText(`${deck.remaining}`, 20 + CARD_WIDTH / 2, 100 + CARD_HEIGHT + 12);
 
-  // ─── Animation layer ───
+  // Joker slots
+  renderJokerSlots();
+
+  // Animation layer
   renderAnimations(ctx, (card, x, y, angle) => {
     drawCardFaceAt(ctx, card, x + CARD_WIDTH / 2, y + CARD_HEIGHT / 2, angle);
   });
 
-  // ─── Hand (fan layout) ───
+  // Hand (fan layout)
   if (!isAnimating()) {
     const baseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70;
     const cx = CANVAS_WIDTH / 2;
@@ -287,13 +436,12 @@ function renderPlayScene() {
     }
   }
 
-  // ─── Action buttons ───
+  // Action buttons
   const canPlay = selected.size > 0 && !isAnimating() && round.handsRemaining > 0;
   const canDiscard = selected.size > 0 && round.discardsRemaining > 0 && !isAnimating() && phase === 'playing';
   drawButton(B.PLAY, 'PLAY', canPlay);
   drawButton(B.DISCARD, 'DISCARD', canDiscard);
 
-  // "Out of hands" message
   if (round.handsRemaining <= 0 && !round.isBlindBeaten && !isAnimating()) {
     ctx.fillStyle = '#e63946';
     ctx.font = 'bold 16px monospace';
@@ -303,30 +451,29 @@ function renderPlayScene() {
 }
 
 function renderShopScene() {
-  // Dark overlay
   ctx.fillStyle = 'rgba(0,0,0,0.75)';
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-  // Title
   ctx.fillStyle = '#ffd700';
   ctx.font = 'bold 28px monospace';
   ctx.textAlign = 'center';
   ctx.fillText('🏪 SHOP', CANVAS_WIDTH / 2, 50);
 
-  // Gold
   ctx.fillStyle = '#ffd700';
   ctx.font = 'bold 18px monospace';
   ctx.fillText(`Gold: $${shop.gold}`, CANVAS_WIDTH / 2, 80);
 
-  // Blind info
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.font = '13px monospace';
   ctx.fillText(pendingNewAnte ? `⬆ ANTE ${round.ante}!` : round.blindLabel, CANVAS_WIDTH / 2, 105);
 
-  // ─── Items ───
+  // Joker slots in shop
+  renderJokerSlots();
+
+  // Items
   shopBtnRects = [];
   const itemW = 160;
-  const itemH = 160;
+  const itemH = 170;
   const gap = 20;
   const totalW = shop.items.length * itemW + (shop.items.length - 1) * gap;
   const startX = (CANVAS_WIDTH - totalW) / 2;
@@ -335,34 +482,37 @@ function renderShopScene() {
   shop.items.forEach((item, i) => {
     const x = startX + i * (itemW + gap);
 
-    // Card
-    ctx.fillStyle = '#1a1a2e';
-    ctx.strokeStyle = 'rgba(255,215,0,0.3)';
+    const isJoker = !!item.jokerDef;
+    ctx.fillStyle = isJoker ? '#1a1a2e' : '#1a1a2e';
+    ctx.strokeStyle = isJoker ? 'rgba(255,215,0,0.5)' : 'rgba(100,180,255,0.3)';
     ctx.lineWidth = 2;
     roundRect(ctx, x, itemY, itemW, itemH, 10);
     ctx.fill();
     ctx.stroke();
 
-    // Item name
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 16px monospace';
+    // Type badge
+    ctx.fillStyle = isJoker ? 'rgba(255,215,0,0.15)' : 'rgba(100,180,255,0.15)';
+    ctx.font = '10px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(item.name, x + itemW / 2, itemY + 30);
+    ctx.fillText(isJoker ? '🃏 JOKER' : '📦 ITEM', x + itemW / 2, itemY + 18);
 
-    // Description
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 15px monospace';
+    ctx.fillText(item.name, x + itemW / 2, itemY + 42);
+
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.font = '12px monospace';
-    ctx.fillText(item.description, x + itemW / 2, itemY + 58);
+    ctx.font = '11px monospace';
+    ctx.fillText(item.description, x + itemW / 2, itemY + 68);
 
     // Price
     const affordable = shop.gold >= item.cost;
     ctx.fillStyle = affordable ? '#ffd700' : '#666';
     ctx.font = 'bold 18px monospace';
-    ctx.fillText(`$${item.cost}`, x + itemW / 2, itemY + 95);
+    ctx.fillText(`$${item.cost}`, x + itemW / 2, itemY + 105);
 
     // Buy button
     const buyX = x + 10;
-    const buyY = itemY + 110;
+    const buyY = itemY + 118;
     const buyW = itemW - 20;
     const buyH = 34;
     shopBtnRects.push({ x: buyX, y: buyY, w: buyW, h: buyH, index: i });
@@ -379,7 +529,6 @@ function renderShopScene() {
     ctx.fillText('BUY', buyX + buyW / 2, buyY + buyH / 2 + 4);
   });
 
-  // ─── Bottom buttons ───
   const canReroll = shop.gold >= 1;
   drawButton(B.SHOP_REROLL, `REROLL $1`, canReroll);
   drawButton(B.SHOP_NEXT, 'NEXT ROUND', true);
@@ -391,7 +540,6 @@ function renderGameOverScene() {
   ctx.fillStyle = 'rgba(0,0,0,0.8)';
   ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-  // Skull
   ctx.fillStyle = '#e63946';
   ctx.font = 'bold 48px monospace';
   ctx.textAlign = 'center';
@@ -402,7 +550,17 @@ function renderGameOverScene() {
   ctx.fillText(`Reached ${round.blindLabel}`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 10);
   ctx.fillText(`Score: ${round.currentScore.toLocaleString()}  |  Gold: $${shop.gold}`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 40);
 
-  // Restart button
+  // Show jokers collected
+  const active = jokers.activeJokers;
+  if (active.length > 0) {
+    ctx.fillStyle = '#ffd700';
+    ctx.font = '14px monospace';
+    ctx.fillText('Jokers:', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 80);
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '12px monospace';
+    ctx.fillText(active.map(j => j.name).join(', '), CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 + 105);
+  }
+
   drawButton(B.GAME_RESTART, 'NEW GAME', true);
   ctx.textBaseline = 'alphabetic';
 }
@@ -439,7 +597,6 @@ canvas.addEventListener('click', (e) => {
 });
 
 function handlePlayClick(mx: number, my: number) {
-  // Check buttons
   if (hitTest(mx, my, B.PLAY) && selected.size > 0 && round.handsRemaining > 0 && !isAnimating()) {
     playHand(); return;
   }
@@ -447,7 +604,6 @@ function handlePlayClick(mx: number, my: number) {
     discardSelected(); return;
   }
 
-  // Check cards
   if (isAnimating() || phase !== 'playing') return;
   const baseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70;
   const cx = CANVAS_WIDTH / 2;
@@ -465,21 +621,16 @@ function handlePlayClick(mx: number, my: number) {
 }
 
 function handleShopClick(mx: number, my: number) {
-  // Buy buttons
   for (const btn of shopBtnRects) {
     if (hitTest(mx, my, btn)) {
       buyShopItem(btn.index);
       return;
     }
   }
-
-  // Reroll
   if (hitTest(mx, my, B.SHOP_REROLL)) {
     if (shop.reroll()) console.log('🔄 Shop rerolled');
     return;
   }
-
-  // Next round
   if (hitTest(mx, my, B.SHOP_NEXT)) {
     exitShop();
   }
@@ -489,7 +640,6 @@ function hitTest(mx: number, my: number, r: { x: number; y: number; w: number; h
   return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
 }
 
-// Keyboard
 document.addEventListener('keydown', (e) => {
   if (e.key === 'p' || e.key === 'P') {
     if (phase === 'playing' && selected.size > 0 && round.handsRemaining > 0 && !isAnimating()) playHand();
@@ -515,6 +665,6 @@ function gameLoop(time: number) {
 
 // ─── Start ───
 startGame();
-console.log('%c=== BALATRO-LIKE (Week 4) ===', 'color: green; font-weight: bold; font-size: 16px');
-console.log('Select cards → PLAY (P) or DISCARD (D)  |  Space = next/skip');
+console.log('%c=== BALATRO-LIKE (Week 5 — Jokers!) ===', 'color: #ffd700; font-weight: bold; font-size: 16px');
+console.log('Buy jokers in the shop, watch them trigger during scoring!');
 requestAnimationFrame(gameLoop);
