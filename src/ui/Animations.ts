@@ -34,6 +34,7 @@ let showChips = 0;
 let showMult = 0;
 let resultHandType = '';
 let resultTotal = 0;
+let resultLevel = 1;
 
 let floatTexts: { text: string; x: number; y: number; progress: number; duration: number }[] = [];
 
@@ -47,6 +48,7 @@ export function startPlayAnimation(
   handType: string,
   chips: number,
   mult: number,
+  level: number,
   callback: () => void,
 ): void {
   const targetX = CANVAS_WIDTH / 2;
@@ -70,6 +72,7 @@ export function startPlayAnimation(
   showMult = 0;
   resultHandType = handType;
   resultTotal = chips * mult;
+  resultLevel = level;
   state = GameAnimState.CardFly;
   onDone = callback;
 }
@@ -86,6 +89,7 @@ export function getShowChips(): number { return showChips; }
 export function getShowMult(): number { return showMult; }
 export function getResultHandType(): string { return resultHandType; }
 export function getResultTotal(): number { return resultTotal; }
+export function getResultLevel(): number { return resultLevel; }
 export function getFloatTexts() { return floatTexts; }
 
 /** Returns true if still animating */
@@ -146,6 +150,7 @@ export function reset(): void {
   scoreProgress = 0;
   floatTexts = [];
   onDone = null;
+  resultLevel = 1;
 }
 
 // ─── Render ───
@@ -183,10 +188,10 @@ export function renderAnimations(
     ctx.textAlign = 'center';
     ctx.globalAlpha = alpha;
 
-    // Hand type
+    // Hand type + level
     ctx.font = `bold ${Math.round(28 * scale)}px monospace`;
     ctx.fillStyle = '#ffd700';
-    ctx.fillText(resultHandType, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 60);
+    ctx.fillText(`${resultHandType}  Lv.${resultLevel}`, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 60);
 
     // Chips and mult
     ctx.font = '18px monospace';

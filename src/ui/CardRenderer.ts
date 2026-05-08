@@ -158,11 +158,12 @@ export function getFanPosition(
   total: number,
   centerX: number,
   baseY: number,
+  maxSpread?: number,
 ): { x: number; y: number; angle: number } {
   if (total <= 1) return { x: centerX, y: baseY, angle: 0 };
 
   const maxAngle = 18;
-  const spread = Math.min(350, total * 40);
+  const spread = Math.min(maxSpread ?? 350, total * 40);
   const progress = total <= 1 ? 0 : (index / (total - 1)) * 2 - 1; // -1 to 1
   const angle = -progress * maxAngle;
   const x = centerX + progress * spread / 2;
@@ -182,4 +183,19 @@ export function fanDrawOrder(total: number): number[] {
     if (left >= 0) order.push(left--);
   }
   return order;
+}
+
+/** Compute position for a card in a vertical cascade */
+export function getCascadePosition(
+  index: number,
+  startX: number,
+  startY: number,
+  overlap: number,
+): { x: number; y: number; angle: number } {
+  return { x: startX, y: startY + index * overlap, angle: 0 };
+}
+
+/** Z-order for cascade: bottom card on top (drawn last) */
+export function cascadeDrawOrder(total: number): number[] {
+  return Array.from({ length: total }, (_, i) => i);
 }

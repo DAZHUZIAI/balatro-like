@@ -1,14 +1,16 @@
 import { CANVAS_WIDTH, CANVAS_HEIGHT, CARD_WIDTH, CARD_HEIGHT } from './utils/Constants.ts';
 import { DeckManager } from './gameplay/DeckManager.ts';
-import { RoundManager, MAX_HANDS_PER_BLIND, MAX_DISCARDS_PER_BLIND } from './gameplay/RoundManager.ts';
+import { RoundManager, MAX_HANDS_PER_BLIND, MAX_DISCARDS_PER_BLIND, BlindType } from './gameplay/RoundManager.ts';
 import { ShopManager } from './gameplay/ShopManager.ts';
 import { JokerManager, isFaceCard } from './gameplay/JokerManager.ts';
-import { drawCardFaceAt, drawCardBack, getFanPosition, fanDrawOrder, roundRect } from './ui/CardRenderer.ts';
+import { drawCardFaceAt, getFanPosition, roundRect } from './ui/CardRenderer.ts';
 import { evaluateHand, handTypeLabel } from './core/HandEvaluator.ts';
 import { startPlayAnimation, update, renderAnimations, isAnimating } from './ui/Animations.ts';
 import type { Card } from './core/Card.ts';
 import type { TarotDef } from './gameplay/TarotData.ts';
+import { RANK_LABELS, SUIT_SYMBOLS } from './core/CardType.ts';
 import { applyEnhancement, isStone, isGlass } from './core/Card.ts';
+import { HandLevelManager } from './gameplay/HandLevelManager.ts';
 
 const canvas = document.getElementById('gameCanvas') as HTMLCanvasElement;
 const ctx = canvas.getContext('2d')!;
@@ -20,28 +22,43 @@ const deck = new DeckManager();
 const round = new RoundManager();
 const shop = new ShopManager();
 const jokers = new JokerManager();
+const handLevels = new HandLevelManager();
 let hand: Card[] = [];
 const selected = new Set<string>();
 const MAX_SELECT = 5;
 
 // ─── UI State ───
-let phase: 'playing' | 'shop' | 'game_over' = 'playing';
+let phase: 'playing' | 'shop' | 'game_over' | 'blind_select' = 'playing';
 let pendingNewAnte = false;
 
 // ─── Tarot State ───
 let tarotInventory: TarotDef[] = [];
 let tarotApplyMode: { tarot: TarotDef } | null = null;
 
+// ─── Blind Selection State ───
+let selectedBlindType: BlindType | null = null;
+let skipMessage = '';
+
 // ─── Button geometry ───
 const B = {
-  USE_TAROT: { x: CANVAS_WIDTH / 2 - 230, y: CANVAS_HEIGHT - 155, w: 110, h: 40 },
-  PLAY: { x: CANVAS_WIDTH / 2 - 110, y: CANVAS_HEIGHT - 155, w: 100, h: 40 },
-  DISCARD: { x: CANVAS_WIDTH / 2 + 10, y: CANVAS_HEIGHT - 155, w: 100, h: 40 },
-  TAROT_CANCEL: { x: CANVAS_WIDTH / 2 - 50, y: CANVAS_HEIGHT - 130, w: 100, h: 32 },
+  USE_TAROT: { x: CANVAS_WIDTH / 2 - 55, y: 96, w: 110, h: 26 },
+  PLAY: { x: CANVAS_WIDTH / 2 - 75, y: 132, w: 150, h: 44 },
+  DISCARD: { x: CANVAS_WIDTH / 2 - 60, y: 186, w: 120, h: 38 },
+  TAROT_CANCEL: { x: CANVAS_WIDTH / 2 - 50, y: 380, w: 100, h: 32 },
   SHOP_NEXT: { x: CANVAS_WIDTH / 2 - 70, y: CANVAS_HEIGHT - 100, w: 140, h: 40 },
   SHOP_REROLL: { x: CANVAS_WIDTH / 2 - 70, y: CANVAS_HEIGHT - 150, w: 140, h: 40 },
   GAME_RESTART: { x: CANVAS_WIDTH / 2 - 70, y: CANVAS_HEIGHT - 120, w: 140, h: 44 },
+  // Blind select
+  BLIND_CARD_1: { x: 80, y: 130, w: 190, h: 260 },
+  BLIND_CARD_2: { x: 305, y: 130, w: 190, h: 260 },
+  BLIND_CARD_3: { x: 530, y: 130, w: 190, h: 260 },
+  BLIND_CONFIRM: { x: CANVAS_WIDTH / 2 - 80, y: 420, w: 160, h: 40 },
+  BLIND_SKIP: { x: CANVAS_WIDTH / 2 - 60, y: 480, w: 120, h: 32 },
 };
+
+const BLIND_POSITIONS = [B.BLIND_CARD_1, B.BLIND_CARD_2, B.BLIND_CARD_3];
+
+const handFanBaseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 50;
 
 let shopBtnRects: { x: number; y: number; w: number; h: number; index: number }[] = [];
 let jokerSlotRects: { x: number; y: number; w: number; h: number; index: number }[] = [];
@@ -54,13 +71,15 @@ function startGame() {
   round.newGame();
   shop.gold = 0;
   jokers.clear();
+  handLevels.reset();
   tarotInventory = [];
   tarotApplyMode = null;
   shop.generate();
-  phase = 'playing';
   pendingNewAnte = false;
-  dealNewHand();
-  console.log(`%c=== NEW GAME: ${round.blindLabel} — target ${round.getBlindConfig().targetScore} ===`, 'color: #ffd700; font-weight: bold');
+  selectedBlindType = null;
+  skipMessage = '';
+  phase = 'blind_select';
+  console.log(`%c=== NEW GAME ===`, 'color: #ffd700; font-weight: bold');
 }
 
 function dealNewHand() {
@@ -75,14 +94,31 @@ function playHand() {
 
   const playedCards = hand.filter(c => selected.has(c.id));
   const result = evaluateHand(playedCards);
-  let chips = result.score.chips;
-  let mult = result.score.mult;
+
+  // Use leveled base chips/mult
+  let chips = handLevels.getBaseChips(result.handType);
+  let mult = handLevels.getBaseMult(result.handType);
+  const handLevel = handLevels.getLevel(result.handType);
 
   // ─── Joker pipeline ───
   // 1. Per-card joker effects + enhancement bonuses
   let goldFromCards = 0;
   const brokenGlass: string[] = [];
+  const boss = round.getBossEffect();
+  const debuffedSuits = boss?.debuffedSuits ?? [];
   for (const card of playedCards) {
+    const isDebuffed = debuffedSuits.includes(card.suit);
+
+    // The Mark: debuffed cards contribute nothing from enhancements
+    if (isDebuffed) {
+      // Joker effects still apply (check independent conditions)
+      const cardResult = jokers.applyCardScored(card, 0, 0);
+      mult += cardResult.mult;
+      goldFromCards += cardResult.gold;
+      // No chip contribution from debuffed cards
+      continue;
+    }
+
     // Joker card-scored effects
     const cardResult = jokers.applyCardScored(card, 0, 0);
     chips += cardResult.chips;
@@ -161,7 +197,7 @@ function playHand() {
   const handType = handTypeLabel(result.handType);
   const fromPositions = playedCards.map(c => {
     const idx = hand.indexOf(c);
-    return getFanPosition(idx, hand.length, CANVAS_WIDTH / 2, CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70);
+    return getFanPosition(idx, hand.length, CANVAS_WIDTH / 2, handFanBaseY, 480);
   });
 
   // Remove played cards, draw replacements
@@ -182,7 +218,22 @@ function playHand() {
   console.log(`%c[PLAY] ${handType} ${chips}×${mult}=${score} (${round.currentScore}/${round.getBlindConfig().targetScore})`,
     beaten ? 'color: #4caf50; font-weight: bold' : 'color: gold');
 
-  startPlayAnimation(playedCards, fromPositions, handType, chips, mult, () => {
+  startPlayAnimation(playedCards, fromPositions, handType, chips, mult, handLevel, () => {
+    // Boss: The Hook — discard 1 random card from hand after each play
+    if (boss?.randomDiscardAfterPlay && hand.length > 0) {
+      const randomIdx = Math.floor(Math.random() * hand.length);
+      const removed = hand.splice(randomIdx, 1)[0];
+      deck.discard(removed);
+      console.log(`🎣 The Hook: discarded ${RANK_LABELS[removed.rank]}${SUIT_SYMBOLS[removed.suit]}`);
+    }
+
+    // Boss: The Arm — reduce hand level by 1 after each played hand
+    if (boss?.reduceHandLevel) {
+      const cur = handLevels.getLevel(result.handType);
+      const newLevel = handLevels.reduceLevel(result.handType);
+      console.log(`💪 The Arm: ${result.handType} reduced to Lv.${newLevel} (was Lv.${cur})`);
+    }
+
     if (beaten) {
       onBlindBeaten();
     } else if (round.isOutOfHands) {
@@ -259,6 +310,14 @@ function buyShopItem(index: number) {
     return;
   }
 
+  // Check if this is a planet card
+  if (item.planetDef) {
+    const planet = item.planetDef;
+    const newLevel = handLevels.levelUp(planet.handType);
+    console.log(`🪐 Bought planet: ${planet.name} — ${planet.description} now Lv.${newLevel}`);
+    return;
+  }
+
   // Utility items
   switch (item.id) {
     case 'add_hand':
@@ -282,9 +341,9 @@ function buyShopItem(index: number) {
 function exitShop() {
   jokers.resetRound();
   round.resetRound();
-  dealNewHand();
-  phase = 'playing';
-  console.log(`\n%c=== ${round.blindLabel} — target ${round.getBlindConfig().targetScore} ===`, 'color: #ffd700; font-weight: bold');
+  selectedBlindType = null;
+  skipMessage = '';
+  phase = 'blind_select';
 }
 
 // ─── Tarot functions ───
@@ -308,6 +367,43 @@ function applyTarotToCard(cardId: string): boolean {
   console.log(`🔮 Applied ${mode.tarot.name} (${mode.tarot.enhancement})`);
   tarotApplyMode = null;
   return true;
+}
+
+// ─── Blind Selection ───
+
+function selectBlind(type: BlindType): void {
+  selectedBlindType = type;
+  skipMessage = '';
+}
+
+function confirmBlindSelection(): void {
+  if (!selectedBlindType) return;
+  round.selectBlind(selectedBlindType);
+
+  // Apply any pending skip reward from previous skip
+  const reward = round.applySkipReward();
+  if (reward.gold > 0) shop.earn(reward.gold);
+  if (reward.extraHands > 0) round.handsRemaining += reward.extraHands;
+  if (reward.extraDiscards > 0) round.discardsRemaining += reward.extraDiscards;
+
+  dealNewHand();
+  phase = 'playing';
+  const boss = round.getBossEffect();
+  if (boss) {
+    console.log(`%c👹 BOSS: ${boss.name} — ${boss.description}`, 'color: #e63946; font-weight: bold');
+  }
+  console.log(`%c=== ${round.blindLabel} — target ${round.getBlindConfig().targetScore} ===`, 'color: #ffd700; font-weight: bold');
+}
+
+function handleSkipBlind(): void {
+  const reward = round.skipBlind();
+  selectedBlindType = null;
+  // Apply gold immediately
+  if (reward.goldAmount && reward.goldAmount > 0) {
+    shop.earn(reward.goldAmount);
+  }
+  skipMessage = `Skipped! Reward: ${reward.label}`;
+  console.log(`⏭️ Skipped blind — reward: ${reward.label}`);
 }
 
 // ─── Rendering ───
@@ -419,111 +515,210 @@ function render() {
   if (phase === 'playing') renderPlayScene();
   else if (phase === 'shop') renderShopScene();
   else if (phase === 'game_over') renderGameOverScene();
+  else if (phase === 'blind_select') renderBlindSelectScene();
+}
+
+/** Horizontal joker slots row for play scene */
+function renderJokerRow() {
+  const slotW = 90;
+  const slotH = 24;
+  const gap = 4;
+  const totalW = 5 * slotW + 4 * gap;
+  const startX = (CANVAS_WIDTH - totalW) / 2;
+  const y = 38;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('JOKERS', CANVAS_WIDTH / 2, y - 4);
+
+  for (let i = 0; i < 5; i++) {
+    const x = startX + i * (slotW + gap);
+    const joker = jokers.slots[i];
+
+    if (joker) {
+      ctx.fillStyle = '#1a1a2e';
+      ctx.strokeStyle = 'rgba(255,215,0,0.4)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, x, y, slotW, slotH, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'left';
+      ctx.fillText(joker.name, x + 5, y + 10);
+
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.font = '7px monospace';
+      ctx.fillText(joker.description.substring(0, 16), x + 5, y + 19);
+
+      // Special state displays
+      ctx.textAlign = 'right';
+      ctx.font = 'bold 8px monospace';
+      if (joker.id === 'ice_cream') {
+        ctx.fillStyle = '#64b5f6';
+        ctx.fillText(`${jokers.iceCreamMult}m`, x + slotW - 4, y + 10);
+      } else if (joker.id === 'egg') {
+        ctx.fillStyle = '#ffd700';
+        ctx.fillText(`$${jokers.getState('egg_gold')}`, x + slotW - 4, y + 10);
+      } else if (joker.id === 'ramen') {
+        ctx.fillStyle = '#e8a87c';
+        ctx.fillText(`${jokers.ramenMult}m`, x + slotW - 4, y + 10);
+      }
+    } else {
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      roundRect(ctx, x, y, slotW, slotH, 4);
+      ctx.stroke();
+    }
+  }
 }
 
 function renderPlayScene() {
   const blind = round.getBlindConfig();
 
-  // Top bar
+  // ─── Top info bar ───
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.font = 'bold 20px monospace';
+  ctx.font = 'bold 14px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText(round.blindLabel, 20, 28);
+  ctx.fillText(round.blindLabel, 15, 16);
 
   ctx.fillStyle = '#ffd700';
   ctx.textAlign = 'right';
-  ctx.font = 'bold 16px monospace';
-  ctx.fillText(`$${shop.gold}`, CANVAS_WIDTH - 20, 28);
+  ctx.font = 'bold 14px monospace';
+  ctx.fillText(`$${shop.gold}`, CANVAS_WIDTH - 15, 16);
 
+  // Stats line
   ctx.textAlign = 'left';
-  ctx.font = '13px monospace';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.font = '11px monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.fillText(`Hands: ${round.handsRemaining}/${MAX_HANDS_PER_BLIND}  ` +
     `Discards: ${round.discardsRemaining}/${MAX_DISCARDS_PER_BLIND}  ` +
     `Deck: ${deck.remaining}`,
-    20, 50);
+    15, 32);
 
-  // Score bar
-  renderScoreBar(62, round.currentScore, blind.targetScore);
+  // Joker count on right
+  ctx.textAlign = 'right';
+  ctx.fillText(`Jokers: ${jokers.activeJokers.length}/5`, CANVAS_WIDTH - 15, 32);
 
-  // Deck pile
-  drawCardBack(ctx, 20, 100);
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.font = '11px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(`${deck.remaining}`, 20 + CARD_WIDTH / 2, 100 + CARD_HEIGHT + 12);
+  // ─── Joker row (horizontal) ───
+  renderJokerRow();
 
-  // Joker slots
-  renderJokerSlots();
+  // ─── Score bar ───
+  renderScoreBar(68, round.currentScore, blind.targetScore);
 
-  // Animation layer
+  // ─── Boss effect display ───
+  const bossEffect = round.getBossEffect();
+  if (bossEffect) {
+    ctx.fillStyle = '#e63946';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`👹 ${bossEffect.name}: ${bossEffect.description}`, CANVAS_WIDTH / 2, 88);
+  }
+
+  // ─── Animation layer ───
   renderAnimations(ctx, (card, x, y, angle) => {
     drawCardFaceAt(ctx, card, x + CARD_WIDTH / 2, y + CARD_HEIGHT / 2, angle);
   });
 
-  // Hand (fan layout)
-  if (!isAnimating()) {
-    const baseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70;
-    const cx = CANVAS_WIDTH / 2;
-    const positions = hand.map((_, i) => getFanPosition(i, hand.length, cx, baseY));
-    const drawOrder = fanDrawOrder(hand.length);
+  // ─── Hand level info when cards selected ───
+  if (selected.size > 0) {
+    const playedCards = hand.filter(c => selected.has(c.id));
+    const preview = evaluateHand(playedCards);
+    const lvl = handLevels.getLevel(preview.handType);
+    const nextChips = handLevels.getBaseChips(preview.handType);
+    const nextMult = handLevels.getBaseMult(preview.handType);
+    ctx.fillStyle = 'rgba(180,100,255,0.6)';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(
+      `${handTypeLabel(preview.handType)} Lv.${lvl}  —  ${nextChips} chips × ${nextMult} mult`,
+      CANVAS_WIDTH / 2, 92,
+    );
+  }
 
-    for (const idx of drawOrder) {
+  // ─── Action buttons (center) ───
+  const boss = round.getBossEffect();
+  const requireExactFive = boss?.requireExactFive ?? false;
+  const canPlay = selected.size > 0 && !isAnimating() && round.handsRemaining > 0
+    && (!requireExactFive || selected.size === 5);
+  const canDiscard = selected.size > 0 && round.discardsRemaining > 0 && !isAnimating();
+  const canUseTarot = tarotInventory.length > 0 && !isAnimating() && round.handsRemaining > 0 && !tarotApplyMode;
+
+  // USE TAROT (small, subtle)
+  drawButton(B.USE_TAROT, `USE TAROT${tarotInventory.length > 0 ? ` (${tarotInventory.length})` : ''}`, canUseTarot, '#888', '#222', 11);
+
+  // PLAY (big, prominent)
+  drawButton(B.PLAY, 'PLAY', canPlay, '#ffd700', '#1a1a2e', 18);
+
+  // DISCARD (medium)
+  drawButton(B.DISCARD, 'DISCARD', canDiscard, '#ccc', '#1a1a2e', 15);
+
+  // Hint text
+  if (selected.size === 0 && round.handsRemaining > 0 && !isAnimating()) {
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(
+      requireExactFive ? 'Select exactly 5 cards to play' : 'Select 2-5 cards to play a hand',
+      CANVAS_WIDTH / 2, 228,
+    );
+  }
+
+  // ─── Hand (fan layout at bottom) ───
+  if (!isAnimating()) {
+    const positions = hand.map((_, i) => getFanPosition(i, hand.length, CANVAS_WIDTH / 2, handFanBaseY, 480));
+    // Left to right (last card on top)
+    for (let idx = 0; idx < hand.length; idx++) {
       const card = hand[idx];
       const pos = positions[idx];
       const isSelected = selected.has(card.id);
 
-      drawCardFaceAt(ctx, card, pos.x, pos.y, pos.angle);
+      // Lift selected cards up
+      const liftY = isSelected ? pos.y - 25 : pos.y;
+
+      drawCardFaceAt(ctx, card, pos.x, liftY, pos.angle);
 
       if (isSelected) {
         ctx.save();
-        ctx.translate(pos.x, pos.y);
+        ctx.translate(pos.x, liftY);
         if (pos.angle !== 0) ctx.rotate(pos.angle * Math.PI / 180);
-        ctx.translate(-pos.x, -pos.y);
+        ctx.translate(-pos.x, -liftY);
 
         ctx.strokeStyle = '#ffd700';
         ctx.lineWidth = 3;
         ctx.shadowColor = '#ffd700';
         ctx.shadowBlur = 12;
-        ctx.strokeRect(pos.x - CARD_WIDTH / 2 - 2, pos.y - CARD_HEIGHT / 2 - 2, CARD_WIDTH + 4, CARD_HEIGHT + 4);
+        ctx.strokeRect(pos.x - CARD_WIDTH / 2 - 2, liftY - CARD_HEIGHT / 2 - 2, CARD_WIDTH + 4, CARD_HEIGHT + 4);
 
         ctx.fillStyle = 'rgba(255, 215, 0, 0.12)';
-        ctx.fillRect(pos.x - CARD_WIDTH / 2, pos.y - CARD_HEIGHT / 2, CARD_WIDTH, CARD_HEIGHT);
+        ctx.fillRect(pos.x - CARD_WIDTH / 2, liftY - CARD_HEIGHT / 2, CARD_WIDTH, CARD_HEIGHT);
         ctx.restore();
 
         const selIdx = [...selected].indexOf(card.id);
         ctx.fillStyle = '#ffd700';
         ctx.beginPath();
-        ctx.arc(pos.x + CARD_WIDTH / 2 - 8, pos.y - CARD_HEIGHT / 2 + 8, 10, 0, Math.PI * 2);
+        ctx.arc(pos.x + CARD_WIDTH / 2 - 8, liftY - CARD_HEIGHT / 2 + 8, 10, 0, Math.PI * 2);
         ctx.fill();
         ctx.fillStyle = '#000';
         ctx.font = 'bold 11px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(`${selIdx + 1}`, pos.x + CARD_WIDTH / 2 - 8, pos.y - CARD_HEIGHT / 2 + 8);
+        ctx.fillText(`${selIdx + 1}`, pos.x + CARD_WIDTH / 2 - 8, liftY - CARD_HEIGHT / 2 + 8);
         ctx.textBaseline = 'alphabetic';
       }
     }
   }
 
-  // Action buttons
-  const canPlay = selected.size > 0 && !isAnimating() && round.handsRemaining > 0;
-  const canDiscard = selected.size > 0 && round.discardsRemaining > 0 && !isAnimating() && phase === 'playing';
-  const canUseTarot = tarotInventory.length > 0 && !isAnimating() && round.handsRemaining > 0 && !tarotApplyMode;
-  drawButton(B.USE_TAROT, 'USE TAROT', canUseTarot);
-  drawButton(B.PLAY, 'PLAY', canPlay);
-  drawButton(B.DISCARD, 'DISCARD', canDiscard);
-
-  // Tarot application mode overlay
+  // ─── Tarot mode overlay ───
   if (tarotApplyMode) {
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
     ctx.fillStyle = '#00e5ff';
     ctx.font = 'bold 16px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(`Apply "${tarotApplyMode.tarot.name}" — Click a card in hand`, CANVAS_WIDTH / 2, CANVAS_HEIGHT - 180);
-
+    ctx.fillText(`Apply "${tarotApplyMode.tarot.name}" — Click a card`, CANVAS_WIDTH / 2, 130);
     ctx.fillStyle = '#e63946';
     roundRect(ctx, B.TAROT_CANCEL.x, B.TAROT_CANCEL.y, B.TAROT_CANCEL.w, B.TAROT_CANCEL.h, 6);
     ctx.fill();
@@ -535,24 +730,12 @@ function renderPlayScene() {
     ctx.textBaseline = 'alphabetic';
   }
 
-  // Tarot inventory display
-  if (tarotInventory.length > 0 && !tarotApplyMode) {
-    ctx.fillStyle = 'rgba(0, 229, 255, 0.6)';
-    ctx.font = '10px monospace';
-    ctx.textAlign = 'left';
-    ctx.fillText('TAROTS:', 20, 100 + CARD_HEIGHT + 30);
-    ctx.font = '11px monospace';
-    tarotInventory.forEach((t, i) => {
-      ctx.fillStyle = '#00e5ff';
-      ctx.fillText(t.name, 20 + i * 85, 100 + CARD_HEIGHT + 50);
-    });
-  }
-
+  // No hands remaining
   if (round.handsRemaining <= 0 && !round.isBlindBeaten && !isAnimating()) {
     ctx.fillStyle = '#e63946';
     ctx.font = 'bold 16px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('No hands remaining!', CANVAS_WIDTH / 2, CANVAS_HEIGHT - 170);
+    ctx.fillText('No hands remaining!', CANVAS_WIDTH / 2, 230);
   }
 }
 
@@ -590,18 +773,19 @@ function renderShopScene() {
 
     const isJoker = !!item.jokerDef;
     const isTarot = !!item.tarotDef;
-    ctx.fillStyle = isTarot ? '#1a1a3e' : '#1a1a2e';
-    ctx.strokeStyle = isTarot ? 'rgba(0,229,255,0.5)' : (isJoker ? 'rgba(255,215,0,0.5)' : 'rgba(100,180,255,0.3)');
+    const isPlanet = !!item.planetDef;
+    ctx.fillStyle = isTarot ? '#1a1a3e' : isPlanet ? '#2a1a3e' : '#1a1a2e';
+    ctx.strokeStyle = isTarot ? 'rgba(0,229,255,0.5)' : isPlanet ? 'rgba(180,100,255,0.5)' : (isJoker ? 'rgba(255,215,0,0.5)' : 'rgba(100,180,255,0.3)');
     ctx.lineWidth = 2;
     roundRect(ctx, x, itemY, itemW, itemH, 10);
     ctx.fill();
     ctx.stroke();
 
     // Type badge
-    ctx.fillStyle = isTarot ? 'rgba(0,229,255,0.15)' : (isJoker ? 'rgba(255,215,0,0.15)' : 'rgba(100,180,255,0.15)');
+    ctx.fillStyle = isTarot ? 'rgba(0,229,255,0.15)' : isPlanet ? 'rgba(180,100,255,0.15)' : (isJoker ? 'rgba(255,215,0,0.15)' : 'rgba(100,180,255,0.15)');
     ctx.font = '10px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(isTarot ? '🔮 TAROT' : (isJoker ? '🃏 JOKER' : '📦 ITEM'), x + itemW / 2, itemY + 18);
+    ctx.fillText(isTarot ? '🔮 TAROT' : isPlanet ? '🪐 PLANET' : (isJoker ? '🃏 JOKER' : '📦 ITEM'), x + itemW / 2, itemY + 18);
 
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 15px monospace';
@@ -672,16 +856,117 @@ function renderGameOverScene() {
   ctx.textBaseline = 'alphabetic';
 }
 
-function drawButton(def: { x: number; y: number; w: number; h: number }, label: string, enabled: boolean) {
-  ctx.fillStyle = enabled ? '#1a1a2e' : '#222';
-  ctx.strokeStyle = enabled ? '#ffd700' : '#444';
+function renderBlindSelectScene() {
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  // Title
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 26px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`SELECT BLIND — Ante ${round.ante}`, CANVAS_WIDTH / 2, 50);
+
+  // Gold display
+  ctx.fillStyle = '#ffd700';
+  ctx.font = 'bold 14px monospace';
+  ctx.fillText(`Gold: $${shop.gold}`, CANVAS_WIDTH / 2, 78);
+
+  // Skip message
+  if (skipMessage) {
+    ctx.fillStyle = '#8bc34a';
+    ctx.font = 'bold 13px monospace';
+    ctx.fillText(skipMessage, CANVAS_WIDTH / 2, 105);
+  }
+
+  // Render 3 blind cards
+  const blinds = round.getAvailableBlinds();
+  blinds.forEach((blind, i) => {
+    const rect = BLIND_POSITIONS[i];
+    const isSelected = selectedBlindType === blind.type;
+
+    // Card background
+    const isBoss = blind.type === 'boss';
+    ctx.fillStyle = isSelected
+      ? (isBoss ? '#3d1a2e' : '#1a2a3d')
+      : (isBoss ? '#2a1a1e' : '#1a1a2e');
+    ctx.strokeStyle = isSelected
+      ? '#ffd700'
+      : (isBoss ? 'rgba(230,57,70,0.5)' : 'rgba(255,255,255,0.2)');
+    ctx.lineWidth = isSelected ? 3 : 1;
+    roundRect(ctx, rect.x, rect.y, rect.w, rect.h, 12);
+    ctx.fill();
+    ctx.stroke();
+
+    // Blind type label
+    ctx.fillStyle = isBoss ? '#e63946' : '#64b5f6';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+    const typeLabels: Record<string, string> = {
+      small: 'SMALL BLIND',
+      big: 'BIG BLIND',
+      boss: 'BOSS BLIND',
+    };
+    ctx.fillText(typeLabels[blind.type], rect.x + rect.w / 2, rect.y + 30);
+
+    // Boss name (if boss)
+    if (blind.bossEffect) {
+      ctx.fillStyle = '#ff6b6b';
+      ctx.font = 'bold 16px monospace';
+      ctx.fillText(blind.bossEffect.name, rect.x + rect.w / 2, rect.y + 60);
+    }
+
+    // Target score
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.fillText('Target', rect.x + rect.w / 2, rect.y + 90);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText(blind.targetScore.toLocaleString(), rect.x + rect.w / 2, rect.y + 120);
+
+    // Reward
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '12px monospace';
+    ctx.fillText('Reward', rect.x + rect.w / 2, rect.y + 155);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 16px monospace';
+    ctx.fillText(`+$${blind.rewardGold}`, rect.x + rect.w / 2, rect.y + 178);
+
+    // Boss effect description
+    if (blind.bossEffect) {
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = '10px monospace';
+      ctx.fillText(blind.bossEffect.description, rect.x + rect.w / 2, rect.y + 210);
+    }
+  });
+
+  // Confirm button (only when a blind is selected)
+  const canConfirm = selectedBlindType !== null;
+  drawButton(B.BLIND_CONFIRM, 'CONFIRM', canConfirm, '#ffd700', '#1a1a2e', 15);
+
+  // Skip button — always visible for non-boss blinds (just skip whatever is current)
+  const currentType = round.currentBlind;
+  const canSkip = currentType !== 'boss' || round.ante <= 1;
+  drawButton(B.BLIND_SKIP, 'SKIP', canSkip, '#888', '#222', 12);
+  if (currentType === 'boss') {
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Cannot skip Boss Blind', CANVAS_WIDTH / 2, B.BLIND_SKIP.y + B.BLIND_SKIP.h + 14);
+  }
+
+  ctx.textBaseline = 'alphabetic';
+}
+
+function drawButton(def: { x: number; y: number; w: number; h: number }, label: string, enabled: boolean, accentColor = '#ffd700', bgColor = '#1a1a2e', fontSize = 14) {
+  ctx.fillStyle = enabled ? bgColor : '#222';
+  ctx.strokeStyle = enabled ? accentColor : '#444';
   ctx.lineWidth = 2;
   roundRect(ctx, def.x, def.y, def.w, def.h, 8);
   ctx.fill();
   ctx.stroke();
 
-  ctx.fillStyle = enabled ? '#ffd700' : '#555';
-  ctx.font = 'bold 14px monospace';
+  ctx.fillStyle = enabled ? accentColor : '#555';
+  ctx.font = `bold ${fontSize}px monospace`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(label, def.x + def.w / 2, def.y + def.h / 2);
@@ -700,6 +985,8 @@ canvas.addEventListener('click', (e) => {
     handleShopClick(mx, my);
   } else if (phase === 'game_over') {
     if (hitTest(mx, my, B.GAME_RESTART)) startGame();
+  } else if (phase === 'blind_select') {
+    handleBlindSelectClick(mx, my);
   }
 });
 
@@ -710,15 +997,13 @@ function handlePlayClick(mx: number, my: number) {
       cancelTarotMode();
       return;
     }
-    // Click card to apply tarot
-    const baseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70;
-    const cx = CANVAS_WIDTH / 2;
-    const drawOrder = fanDrawOrder(hand.length).reverse();
-    for (const idx of drawOrder) {
-      const pos = getFanPosition(idx, hand.length, cx, baseY);
+    // Click card to apply tarot (fan hit-test, rightmost on top)
+    const positions = hand.map((_, i) => getFanPosition(i, hand.length, CANVAS_WIDTH / 2, handFanBaseY, 480));
+    for (let i = hand.length - 1; i >= 0; i--) {
+      const pos = positions[i];
       if (mx >= pos.x - CARD_WIDTH / 2 && mx <= pos.x + CARD_WIDTH / 2 &&
           my >= pos.y - CARD_HEIGHT / 2 && my <= pos.y + CARD_HEIGHT / 2) {
-        applyTarotToCard(hand[idx].id);
+        applyTarotToCard(hand[i].id);
         return;
       }
     }
@@ -740,14 +1025,12 @@ function handlePlayClick(mx: number, my: number) {
   }
 
   if (isAnimating() || phase !== 'playing') return;
-  const baseY = CANVAS_HEIGHT - CARD_HEIGHT / 2 - 70;
-  const cx = CANVAS_WIDTH / 2;
-  const drawOrder = fanDrawOrder(hand.length).reverse();
-  for (const idx of drawOrder) {
-    const pos = getFanPosition(idx, hand.length, cx, baseY);
+  const positions = hand.map((_, i) => getFanPosition(i, hand.length, CANVAS_WIDTH / 2, handFanBaseY, 480));
+  for (let i = hand.length - 1; i >= 0; i--) {
+    const pos = positions[i];
     if (mx >= pos.x - CARD_WIDTH / 2 && mx <= pos.x + CARD_WIDTH / 2 &&
         my >= pos.y - CARD_HEIGHT / 2 && my <= pos.y + CARD_HEIGHT / 2) {
-      const card = hand[idx];
+      const card = hand[i];
       if (selected.has(card.id)) selected.delete(card.id);
       else if (selected.size < MAX_SELECT) selected.add(card.id);
       return;
@@ -768,6 +1051,32 @@ function handleShopClick(mx: number, my: number) {
   }
   if (hitTest(mx, my, B.SHOP_NEXT)) {
     exitShop();
+  }
+}
+
+function handleBlindSelectClick(mx: number, my: number) {
+  // Check blind card clicks
+  const blinds = round.getAvailableBlinds();
+  for (let i = 0; i < blinds.length; i++) {
+    if (hitTest(mx, my, BLIND_POSITIONS[i])) {
+      selectBlind(blinds[i].type);
+      return;
+    }
+  }
+
+  // Confirm button
+  if (hitTest(mx, my, B.BLIND_CONFIRM) && selectedBlindType !== null) {
+    confirmBlindSelection();
+    return;
+  }
+
+  // Skip button
+  if (hitTest(mx, my, B.BLIND_SKIP)) {
+    const currentType = round.currentBlind;
+    if (currentType !== 'boss' || round.ante <= 1) {
+      handleSkipBlind();
+    }
+    return;
   }
 }
 

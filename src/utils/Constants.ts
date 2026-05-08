@@ -3,8 +3,8 @@ export const CANVAS_WIDTH = 800;
 export const CANVAS_HEIGHT = 600;
 
 /** Card rendering */
-export const CARD_WIDTH = 70;
-export const CARD_HEIGHT = 98;
+export const CARD_WIDTH = 140;
+export const CARD_HEIGHT = 196;
 export const CARD_RADIUS = 8;
 
 /** Hand (poker hand scoring) */
